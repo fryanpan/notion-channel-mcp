@@ -1,0 +1,20 @@
+{
+  "name": "notion-channel-mcp",
+  "version": "0.1.0",
+  "description": "Claude Code channel connector: routes Notion comment webhooks into subscribed Claude Code sessions via claude-hive.",
+  "license": "MIT",
+  "type": "module",
+  "module": "server.ts",
+  "private": true,
+  "scripts": {
+    "receiver": "bun receiver.ts",
+    "server": "bun server.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^6.0.2"
+  }
+}
