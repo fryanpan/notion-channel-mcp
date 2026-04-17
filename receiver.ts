@@ -22,6 +22,7 @@ import { findMatchingPeers } from "./shared/db.ts";
 import {
   fetchComment,
   fetchPage,
+  fetchPageTextContent,
   getAncestors,
 } from "./shared/notion.ts";
 import {
@@ -39,6 +40,20 @@ const SUMMARY =
   "Notion webhook bridge — routes Notion comment and page events to subscribed peers";
 // Consistent stable_id regardless of which session spawned the receiver.
 const RECEIVER_CWD = import.meta.dir;
+
+// Page content-update events are only routed when the updated page text
+// contains one of these signal patterns. This keeps the channel quiet
+// during normal edit passes and only pings agents when the user
+// explicitly left a directive.
+const CONTENT_UPDATE_PATTERNS = [
+  /\bTODO:/i,
+  /\bClaude\b/i,
+];
+const CONTENT_UPDATE_FILTERED_EVENTS = new Set([
+  "page.content_updated",
+  "page.properties_updated",
+]);
+const SNIPPET_CONTEXT_CHARS = 200;
 
 let myPeerId: string | null = null;
 let myStableId: string | null = null;
@@ -265,14 +280,42 @@ async function processEvent(
     return;
   }
 
+  // Filter: page content/property updates only route when the page
+  // text contains a directive signal (TODO: or Claude). Everything
+  // else (comments, page creates/deletes/moves) routes unfiltered.
+  let snippets: string[] = [];
+  if (CONTENT_UPDATE_FILTERED_EVENTS.has(eventType)) {
+    let content: string;
+    try {
+      content = await fetchPageTextContent(pageId);
+    } catch (err) {
+      log("warn", "could not fetch page content for filtering; dropping", {
+        event_type: eventType,
+        page_id: pageId,
+        error: String(err),
+      });
+      return;
+    }
+    snippets = findDirectiveSnippets(content);
+    if (snippets.length === 0) {
+      log("info", "no TODO/Claude directives found; dropping edit event", {
+        event_type: eventType,
+        page_id: pageId,
+        page_title: page?.title,
+      });
+      return;
+    }
+  }
+
   log("info", "routing event", {
     event_type: eventType,
     page_id: pageId,
     page_title: page?.title,
     matches,
+    snippet_count: snippets.length,
   });
 
-  const payload = formatEventMessage(eventType, pageId, page, comment);
+  const payload = formatEventMessage(eventType, pageId, page, comment, snippets);
   for (const peerStableId of matches) {
     try {
       await sendMessage({
@@ -294,6 +337,7 @@ function formatEventMessage(
   pageId: string,
   page: NotionPage | null,
   comment: NotionComment | null,
+  snippets: string[],
 ): string {
   const urlId = pageId.replace(/-/g, "");
   const url = `https://www.notion.so/${urlId}`;
@@ -321,9 +365,45 @@ function formatEventMessage(
   // Page event
   const emoji = pageEmoji(eventType);
   const label = pageLabel(eventType);
-  return [`${emoji} Notion page ${label}`, `Page: ${title}`, `URL: ${url}`].join(
-    "\n",
-  );
+  const lines = [`${emoji} Notion page ${label}`, `Page: ${title}`, `URL: ${url}`];
+  if (snippets.length > 0) {
+    lines.push("");
+    lines.push("**Directive(s) in the updated content:**");
+    for (const snippet of snippets) {
+      lines.push(`> ${snippet}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Scan page text for directive patterns (TODO: or Claude) and return
+ * snippets of surrounding context. Dedupes overlapping matches.
+ */
+function findDirectiveSnippets(text: string): string[] {
+  const matches: Array<{ start: number; end: number }> = [];
+  for (const pattern of CONTENT_UPDATE_PATTERNS) {
+    const re = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const start = Math.max(0, m.index - SNIPPET_CONTEXT_CHARS / 4);
+      const end = Math.min(text.length, m.index + m[0].length + SNIPPET_CONTEXT_CHARS);
+      matches.push({ start, end });
+    }
+  }
+  if (matches.length === 0) return [];
+  // Merge overlapping ranges.
+  matches.sort((a, b) => a.start - b.start);
+  const merged: Array<{ start: number; end: number }> = [matches[0]];
+  for (let i = 1; i < matches.length; i++) {
+    const prev = merged[merged.length - 1];
+    if (matches[i].start <= prev.end) {
+      prev.end = Math.max(prev.end, matches[i].end);
+    } else {
+      merged.push(matches[i]);
+    }
+  }
+  return merged.map((r) => text.slice(r.start, r.end).trim().replace(/\s+/g, " "));
 }
 
 function pageEmoji(eventType: string): string {

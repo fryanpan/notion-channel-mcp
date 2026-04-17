@@ -115,6 +115,43 @@ async function fetchUserName(userId: string): Promise<string> {
 }
 
 /**
+ * Fetch the flat text content of a page's top-level blocks. Handles
+ * paragraph, heading, to-do, bulleted/numbered list, quote, callout,
+ * toggle, and code blocks. Children of toggles/callouts are NOT
+ * recursed — keeps latency low; the top-level usually contains the
+ * TODOs and mentions we're scanning for.
+ */
+export async function fetchPageTextContent(pageId: string): Promise<string> {
+  const parts: string[] = [];
+  let cursor: string | undefined;
+  // Safety cap: don't fetch more than 5 pages of blocks (~500 blocks).
+  for (let i = 0; i < 5; i++) {
+    const query = cursor ? `?start_cursor=${cursor}&page_size=100` : "?page_size=100";
+    const data = (await apiGet(`/blocks/${pageId}/children${query}`)) as {
+      results: Array<Record<string, unknown>>;
+      has_more: boolean;
+      next_cursor?: string;
+    };
+    for (const block of data.results) {
+      parts.push(extractBlockText(block));
+    }
+    if (!data.has_more || !data.next_cursor) break;
+    cursor = data.next_cursor;
+  }
+  return parts.filter((s) => s).join("\n");
+}
+
+function extractBlockText(block: Record<string, unknown>): string {
+  const type = block.type as string | undefined;
+  if (!type) return "";
+  const data = block[type] as
+    | { rich_text?: Array<{ plain_text?: string }> }
+    | undefined;
+  if (!data?.rich_text) return "";
+  return data.rich_text.map((rt) => rt.plain_text ?? "").join("");
+}
+
+/**
  * Walk up the ancestry chain, returning every ancestor page_id up to
  * the root. Stops at workspace root, a database, a block, or a cycle.
  * Hard cap at MAX_ANCESTRY_DEPTH to avoid pathological pages.
