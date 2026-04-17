@@ -67,24 +67,16 @@ ingress:
 
 Replace `YOUR_USERNAME`, `<tunnel-id>`, and `YOUR-DOMAIN.com`.
 
-## 5. Install launchd services
+## 5. Install the cloudflared launchd service
 
-The receiver and cloudflared both need to auto-start and auto-restart. Templates are in `launchd/`; copy them into `~/Library/LaunchAgents/` with your paths substituted.
+The tunnel needs to auto-start so the public hostname stays stable. The receiver does NOT need its own launchd service — it's spawned on demand by the per-session MCP server (singleton pattern).
 
 ```bash
 mkdir -p ~/Library/LaunchAgents ~/Library/Logs
 
-sed "s|HOME_DIR|$HOME|g" launchd/notion-channel.receiver.plist \
-  > ~/Library/LaunchAgents/notion-channel.receiver.plist
-
 sed "s|HOME_DIR|$HOME|g" launchd/notion-channel.cloudflared.plist \
   > ~/Library/LaunchAgents/notion-channel.cloudflared.plist
-```
 
-Load both:
-
-```bash
-launchctl load ~/Library/LaunchAgents/notion-channel.receiver.plist
 launchctl load ~/Library/LaunchAgents/notion-channel.cloudflared.plist
 ```
 
@@ -92,12 +84,10 @@ Verify:
 
 ```bash
 launchctl list | grep notion-channel
-curl http://localhost:8787/health
-curl https://notion-bridge.YOUR-DOMAIN.com/health   # same response, via the tunnel
-tail -f ~/Library/Logs/notion-channel-receiver.log
+curl https://notion-bridge.YOUR-DOMAIN.com/health   # will 502 until the MCP server starts the receiver; that's OK
 ```
 
-The health endpoint should return `{"status":"ok","peer_id":"...","stable_id":"...","pid":...}`. If `peer_id` is `null`, claude-hive isn't running — start any claude-hive session and the receiver will auto-register within 15 seconds.
+The receiver is spawned automatically by the MCP server on first use (step 7 below). The spawning is idempotent — the first spawn wins the port, subsequent ones detect it and exit cleanly. Log path: `~/Library/Logs/notion-channel-receiver.log`.
 
 ## 6. Create the Notion webhook subscription
 
