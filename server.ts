@@ -11,16 +11,26 @@
  *   - notion_list_my_watches()
  *
  * Subscriptions are written directly to the shared SQLite store; the
- * long-running receiver daemon reads the same store when webhook
- * events arrive. The MCP server does not talk to the receiver over
- * HTTP — it just writes to the database.
+ * receiver reads the same store when webhook events arrive. The MCP
+ * server does not talk to the receiver over HTTP — it just writes to
+ * the database.
+ *
+ * Receiver lifecycle: on startup, this MCP server checks whether the
+ * receiver is already running (/health on the configured port). If not,
+ * it spawns the receiver as a detached background process. The receiver
+ * has a singleton guard — only one instance binds the port. When this
+ * MCP server exits, the receiver keeps running (it's shared across all
+ * sessions).
  *
  * The owning peer's stable_id is computed from this process's cwd,
  * which is inherited from the parent Claude Code session. It matches
- * the stable_id claude-hive derives for that same session, so a
- * subscription recorded here is routable back to the caller's session
- * via claude-hive's /send-message endpoint.
+ * the stable_id claude-hive derives for that same session.
  */
+
+import { spawn } from "node:child_process";
+import { openSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -37,6 +47,12 @@ import {
 } from "./shared/db.ts";
 
 const myStableId = computeStableId(process.cwd());
+const RECEIVER_PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8787", 10);
+const RECEIVER_DIR = import.meta.dir;
+const RECEIVER_LOG = join(
+  homedir(),
+  "Library/Logs/notion-channel-receiver.log",
+);
 
 function log(msg: string, extra?: Record<string, unknown>): void {
   // Only stderr for MCP stdio servers; stdout is the JSON-RPC channel.
@@ -49,6 +65,59 @@ function log(msg: string, extra?: Record<string, unknown>): void {
 }
 
 log("starting", { cwd: process.cwd(), stable_id: myStableId });
+
+// --- Ensure the receiver is running ---
+
+async function receiverIsHealthy(): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${RECEIVER_PORT}/health`, {
+      signal: AbortSignal.timeout(500),
+    });
+    if (!res.ok) return false;
+    const body = (await res.json()) as { status?: string };
+    return body.status === "ok";
+  } catch {
+    return false;
+  }
+}
+
+async function ensureReceiver(): Promise<void> {
+  if (await receiverIsHealthy()) {
+    log("receiver already running");
+    return;
+  }
+  log("spawning receiver");
+  // Open the log file once and hand the descriptor to the child so logs
+  // persist after we exit.
+  const fd = openSync(RECEIVER_LOG, "a");
+  const child = spawn(
+    process.execPath, // current bun binary
+    ["run", join(RECEIVER_DIR, "receiver.ts")],
+    {
+      cwd: RECEIVER_DIR,
+      detached: true,
+      stdio: ["ignore", fd, fd],
+      env: { ...process.env },
+    },
+  );
+  child.unref();
+  // Give it a moment to bind the port before the first tool call lands.
+  for (let i = 0; i < 10; i++) {
+    await new Promise((r) => setTimeout(r, 200));
+    if (await receiverIsHealthy()) {
+      log("receiver ready", { pid: child.pid });
+      return;
+    }
+  }
+  log("receiver did not become healthy within 2s — check log", {
+    log_path: RECEIVER_LOG,
+  });
+}
+
+// Fire-and-forget: don't block MCP startup on receiver spawn. The
+// subscription tools only write to SQLite, which doesn't need the
+// receiver. Events will flow as soon as the receiver binds.
+void ensureReceiver();
 
 const mcp = new Server(
   { name: "notion-channel", version: "0.1.0" },

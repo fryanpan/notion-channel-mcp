@@ -1,17 +1,20 @@
 #!/usr/bin/env bun
 /**
- * notion-channel-mcp — webhook receiver daemon
+ * notion-channel-mcp — webhook receiver
  *
- * Long-running HTTP server that:
- *   1. Handles the Notion webhook verification handshake (echoes the
- *      verification_token on the first POST to /webhook).
- *   2. Receives `comment.created` events from Notion.
- *   3. Fetches the full comment + walks its ancestry via the Notion API.
- *   4. Looks up subscribing peers in the shared SQLite store.
- *   5. Forwards each match to its stable_id via the claude-hive broker.
+ * HTTP server that:
+ *   1. Handles the Notion webhook verification handshake.
+ *   2. Receives comment and page events from Notion.
+ *   3. For each event, resolves the page_id, walks ancestry, and finds
+ *      subscribing peers via the shared SQLite store.
+ *   4. Forwards formatted events to each match via the claude-hive broker.
  *
- * Typically managed by launchd in production. Run directly for dev:
- *   bun receiver.ts
+ * Lifecycle: singleton. The per-session MCP server spawns this on first
+ * use; subsequent sessions detect it's already running via /health and
+ * skip the spawn. If the port is already bound, this process exits 0
+ * quietly — that means another instance won the race.
+ *
+ * Run directly for dev: `bun receiver.ts`
  */
 
 import { computeStableId } from "./shared/stable-id.ts";
@@ -33,7 +36,9 @@ import type { NotionComment, NotionPage } from "./shared/types.ts";
 const PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8787", 10);
 const HEARTBEAT_MS = 15_000;
 const SUMMARY =
-  "Notion webhook bridge — routes Notion comment events to subscribed peers";
+  "Notion webhook bridge — routes Notion comment and page events to subscribed peers";
+// Consistent stable_id regardless of which session spawned the receiver.
+const RECEIVER_CWD = import.meta.dir;
 
 let myPeerId: string | null = null;
 let myStableId: string | null = null;
@@ -52,15 +57,38 @@ function log(level: LogLevel, msg: string, extra?: Record<string, unknown>) {
   console.error(JSON.stringify(line));
 }
 
+// --- Pre-flight singleton check ---
+
+async function anotherInstanceAlreadyRunning(): Promise<boolean> {
+  try {
+    const res = await fetch(`http://127.0.0.1:${PORT}/health`, {
+      signal: AbortSignal.timeout(500),
+    });
+    if (res.ok) {
+      const body = (await res.json()) as { status?: string };
+      return body.status === "ok";
+    }
+  } catch {
+    // fetch failed — nobody listening, we're free to bind
+  }
+  return false;
+}
+
+if (await anotherInstanceAlreadyRunning()) {
+  log("info", "another receiver instance is already running; exiting", {
+    port: PORT,
+  });
+  process.exit(0);
+}
+
 // --- claude-hive registration + heartbeat loop ---
 
 async function registerWithHive(): Promise<void> {
-  const cwd = process.cwd();
-  myStableId = computeStableId(cwd);
+  myStableId = computeStableId(RECEIVER_CWD);
   try {
     const reg = await registerPeer({
       pid: process.pid,
-      cwd,
+      cwd: RECEIVER_CWD,
       git_root: null,
       summary: SUMMARY,
       stable_id: myStableId,
@@ -91,19 +119,24 @@ setInterval(async () => {
     log("warn", "heartbeat failed; will retry on next interval", {
       error: String(err),
     });
-    // If the broker forgot us, drop our cached id so the next tick re-registers.
     if (String(err).includes("404")) {
       myPeerId = null;
     }
   }
 }, HEARTBEAT_MS);
 
-// --- Webhook handler ---
+// --- Event handling ---
+
+interface NotionWebhookEntity {
+  id?: string;
+  type?: string;
+}
 
 interface NotionWebhookBody {
   verification_token?: string;
   type?: string;
-  entity?: { id?: string; type?: string };
+  entity?: NotionWebhookEntity;
+  data?: Record<string, unknown>;
 }
 
 async function handleWebhook(req: Request): Promise<Response> {
@@ -114,32 +147,28 @@ async function handleWebhook(req: Request): Promise<Response> {
     return new Response("invalid json", { status: 400 });
   }
 
-  // Verification handshake: sent once when a new webhook subscription
-  // is created in the Notion UI. The receiver echoes the token back so
-  // Notion knows the endpoint belongs to the integration.
+  // Verification handshake — Notion POSTs this once when creating a subscription.
   if (body.verification_token) {
     log("info", "notion verification handshake", {
-      token_prefix: String(body.verification_token).slice(0, 12) + "...",
+      verification_token: String(body.verification_token),
     });
     return Response.json({ verification_token: body.verification_token });
   }
 
   const eventType = body.type ?? "";
-  if (eventType !== "comment.created") {
-    log("info", "ignoring non-comment event", { type: eventType });
-    return new Response("ok", { status: 200 });
+  const entityType = body.entity?.type ?? "";
+  const entityId = body.entity?.id ?? "";
+
+  if (!eventType || !entityId) {
+    log("warn", "webhook missing type or entity.id", { body });
+    return new Response("missing fields", { status: 400 });
   }
 
-  const commentId = body.entity?.id ?? "";
-  if (!commentId) {
-    return new Response("missing entity.id", { status: 400 });
-  }
-
-  // Process asynchronously so we ack Notion quickly. Notion retries on
-  // 5xx, but only within a short window per POST.
-  processCommentEvent(commentId).catch((err) => {
-    log("error", "processCommentEvent failed", {
-      comment_id: commentId,
+  // Ack fast; process asynchronously.
+  processEvent(eventType, entityType, entityId, body).catch((err) => {
+    log("error", "processEvent failed", {
+      event_type: eventType,
+      entity_id: entityId,
       error: String(err),
     });
   });
@@ -147,23 +176,81 @@ async function handleWebhook(req: Request): Promise<Response> {
   return new Response("accepted", { status: 202 });
 }
 
-async function processCommentEvent(commentId: string): Promise<void> {
-  const comment = await fetchComment(commentId);
-  if (!comment.page_id) {
-    log("warn", "comment has no page_id; cannot route", {
-      comment_id: commentId,
+async function processEvent(
+  eventType: string,
+  entityType: string,
+  entityId: string,
+  body: NotionWebhookBody,
+): Promise<void> {
+  // Resolve the page_id this event is about.
+  // - For comment events: fetch the comment (or use body.data for deletes).
+  // - For page events: the entity IS the page.
+  let pageId: string;
+  let comment: NotionComment | null = null;
+
+  if (eventType.startsWith("comment.")) {
+    if (eventType === "comment.deleted") {
+      // Deleted comments can't be fetched. Notion includes page_id in data.
+      pageId = String(
+        (body.data as { parent?: { page_id?: string } } | undefined)?.parent
+          ?.page_id ?? "",
+      );
+      if (!pageId) {
+        log("info", "comment.deleted has no page_id; cannot route", {
+          comment_id: entityId,
+        });
+        return;
+      }
+    } else {
+      try {
+        comment = await fetchComment(entityId);
+      } catch (err) {
+        log("warn", "failed to fetch comment; cannot route", {
+          comment_id: entityId,
+          error: String(err),
+        });
+        return;
+      }
+      pageId = comment.page_id;
+    }
+  } else if (eventType.startsWith("page.")) {
+    pageId = entityId;
+  } else {
+    log("info", "unhandled event type; skipping", { event_type: eventType });
+    return;
+  }
+
+  if (!pageId) {
+    log("warn", "could not resolve page_id", {
+      event_type: eventType,
+      entity_id: entityId,
     });
     return;
   }
 
-  const page = await fetchPage(comment.page_id);
-  const ancestors = await getAncestors(comment.page_id);
-  const matches = findMatchingPeers(comment.page_id, ancestors);
+  // Best-effort: fetch page for title. For deletes this may fail.
+  let page: NotionPage | null = null;
+  try {
+    page = await fetchPage(pageId);
+  } catch {
+    // Page may be deleted/inaccessible — keep going with just the ID.
+  }
+
+  // Best-effort: walk ancestry for subtree matching.
+  let ancestors: string[] = [];
+  try {
+    ancestors = await getAncestors(pageId);
+  } catch {
+    // OK — direct subscribers will still match via pageId.
+  }
+
+  const matches = findMatchingPeers(pageId, ancestors);
 
   if (matches.length === 0) {
-    log("info", "no subscribers for page", {
-      page_id: comment.page_id,
-      page_title: page.title,
+    log("info", "no subscribers for event", {
+      event_type: eventType,
+      page_id: pageId,
+      page_title: page?.title,
       ancestor_count: ancestors.length,
     });
     return;
@@ -171,20 +258,21 @@ async function processCommentEvent(commentId: string): Promise<void> {
 
   if (!myPeerId) {
     log("warn", "not registered with claude-hive; dropping event", {
-      page_id: comment.page_id,
+      event_type: eventType,
+      page_id: pageId,
       matches,
     });
     return;
   }
 
-  log("info", "routing comment", {
-    page_id: comment.page_id,
-    page_title: page.title,
-    commenter: comment.author_name,
+  log("info", "routing event", {
+    event_type: eventType,
+    page_id: pageId,
+    page_title: page?.title,
     matches,
   });
 
-  const payload = formatCommentMessage(comment, page);
+  const payload = formatEventMessage(eventType, pageId, page, comment);
   for (const peerStableId of matches) {
     try {
       await sendMessage({
@@ -201,21 +289,57 @@ async function processCommentEvent(commentId: string): Promise<void> {
   }
 }
 
-function formatCommentMessage(
-  comment: NotionComment,
-  page: NotionPage,
+function formatEventMessage(
+  eventType: string,
+  pageId: string,
+  page: NotionPage | null,
+  comment: NotionComment | null,
 ): string {
-  // Strip dashes from the page_id to build a Notion URL slug.
-  const urlId = page.id.replace(/-/g, "");
-  return [
-    "📝 New Notion comment",
-    `Page: ${page.title}`,
-    `URL: https://www.notion.so/${urlId}`,
-    `Commenter: ${comment.author_name}`,
-    `Time: ${comment.created_at}`,
-    "",
-    comment.text || "(empty comment body)",
-  ].join("\n");
+  const urlId = pageId.replace(/-/g, "");
+  const url = `https://www.notion.so/${urlId}`;
+  const title = page?.title ?? "(unknown page)";
+
+  if (eventType.startsWith("comment.")) {
+    const header =
+      eventType === "comment.created"
+        ? "💬 Notion comment"
+        : eventType === "comment.updated"
+          ? "✏️ Notion comment updated"
+          : "🗑️ Notion comment deleted";
+    const lines = [header, `Page: ${title}`, `URL: ${url}`];
+    if (comment) {
+      lines.push(`Commenter: ${comment.author_name}`);
+      lines.push(`Time: ${comment.created_at}`);
+      lines.push("");
+      lines.push(comment.text || "(empty comment body)");
+    } else if (eventType === "comment.deleted") {
+      lines.push("(comment deleted — body unavailable)");
+    }
+    return lines.join("\n");
+  }
+
+  // Page event
+  const emoji = pageEmoji(eventType);
+  const label = pageLabel(eventType);
+  return [`${emoji} Notion page ${label}`, `Page: ${title}`, `URL: ${url}`].join(
+    "\n",
+  );
+}
+
+function pageEmoji(eventType: string): string {
+  if (eventType === "page.created") return "🆕";
+  if (eventType === "page.deleted") return "🗑️";
+  if (eventType === "page.undeleted") return "♻️";
+  if (eventType === "page.moved") return "📦";
+  if (eventType === "page.locked") return "🔒";
+  if (eventType === "page.unlocked") return "🔓";
+  if (eventType === "page.content_updated") return "📝";
+  if (eventType === "page.properties_updated") return "🏷️";
+  return "📄";
+}
+
+function pageLabel(eventType: string): string {
+  return eventType.replace(/^page\./, "").replace(/_/g, " ");
 }
 
 // --- HTTP server ---
@@ -242,11 +366,8 @@ Bun.serve({
 
 log("info", `receiver listening on 127.0.0.1:${PORT}`);
 
-// Kick off claude-hive registration. Non-blocking; the heartbeat loop
-// will retry if the broker is down.
 void registerWithHive();
 
-// Graceful shutdown.
 async function cleanup(): Promise<void> {
   if (myPeerId) {
     try {
