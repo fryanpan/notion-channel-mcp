@@ -47,7 +47,7 @@ async function apiGet<T = unknown>(path: string): Promise<T> {
 export async function fetchComment(commentId: string): Promise<NotionComment> {
   const data = (await apiGet(`/comments/${commentId}`)) as {
     id: string;
-    parent: { page_id?: string; block_id?: string };
+    parent: { type?: string; page_id?: string; block_id?: string };
     rich_text: Array<{ plain_text?: string }>;
     created_by: { id?: string };
     created_time: string;
@@ -57,14 +57,53 @@ export async function fetchComment(commentId: string): Promise<NotionComment> {
     .join("");
   const authorId = data.created_by?.id ?? "unknown";
   const authorName = await fetchUserName(authorId).catch(() => "unknown");
+
+  // Resolve parent to an actual page_id. Top-level page comments use
+  // parent.page_id directly. Inline discussion-thread comments use
+  // parent.block_id — we have to walk the block tree up until we find
+  // the owning page.
+  let pageId = data.parent?.page_id ?? "";
+  if (!pageId && data.parent?.block_id) {
+    pageId = await resolveBlockToPage(data.parent.block_id).catch(() => "");
+  }
+
   return {
     id: data.id,
-    page_id: data.parent?.page_id ?? data.parent?.block_id ?? "",
+    page_id: pageId,
     author_id: authorId,
     author_name: authorName,
     text,
     created_at: data.created_time ?? "",
   };
+}
+
+/**
+ * Walk a block's parent chain until we find the owning page. Notion
+ * block.parent can be: page_id, block_id (nested block), database_id,
+ * or workspace. Only page_id is what we want here.
+ */
+async function resolveBlockToPage(blockId: string): Promise<string> {
+  let current = blockId;
+  for (let depth = 0; depth < MAX_ANCESTRY_DEPTH; depth++) {
+    const data = (await apiGet(`/blocks/${current}`)) as {
+      parent?: {
+        type?: string;
+        page_id?: string;
+        block_id?: string;
+        database_id?: string;
+      };
+    };
+    const parent = data.parent;
+    if (!parent) return "";
+    if (parent.type === "page_id" && parent.page_id) return parent.page_id;
+    if (parent.type === "block_id" && parent.block_id) {
+      current = parent.block_id;
+      continue;
+    }
+    // database_id or workspace — not a page-owned block
+    return "";
+  }
+  return "";
 }
 
 export async function fetchPage(pageId: string): Promise<NotionPage> {
