@@ -42,18 +42,16 @@ const SUMMARY =
 const RECEIVER_CWD = import.meta.dir;
 
 // Page content-update events are only routed when the updated page text
-// contains one of these signal patterns. This keeps the channel quiet
-// during normal edit passes and only pings agents when the user
-// explicitly left a directive.
-const CONTENT_UPDATE_PATTERNS = [
-  /\bTODO:/i,
-  /\bClaude\b/i,
-];
+// contains an explicit directive (TODO: or Claude: at the start of a
+// line, allowing list / blockquote / bold markup). Product-name
+// mentions like "Claude Design" or "Claude Code" must NOT trigger.
+// See shared/directive-filter.ts for the patterns + tests.
+import { findDirectiveSnippets } from "./shared/directive-filter.ts";
+
 const CONTENT_UPDATE_FILTERED_EVENTS = new Set([
   "page.content_updated",
   "page.properties_updated",
 ]);
-const SNIPPET_CONTEXT_CHARS = 200;
 
 let myPeerId: string | null = null;
 let myStableId: string | null = null;
@@ -374,36 +372,6 @@ function formatEventMessage(
     }
   }
   return lines.join("\n");
-}
-
-/**
- * Scan page text for directive patterns (TODO: or Claude) and return
- * snippets of surrounding context. Dedupes overlapping matches.
- */
-function findDirectiveSnippets(text: string): string[] {
-  const matches: Array<{ start: number; end: number }> = [];
-  for (const pattern of CONTENT_UPDATE_PATTERNS) {
-    const re = new RegExp(pattern.source, pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g");
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(text)) !== null) {
-      const start = Math.max(0, m.index - SNIPPET_CONTEXT_CHARS / 4);
-      const end = Math.min(text.length, m.index + m[0].length + SNIPPET_CONTEXT_CHARS);
-      matches.push({ start, end });
-    }
-  }
-  if (matches.length === 0) return [];
-  // Merge overlapping ranges.
-  matches.sort((a, b) => a.start - b.start);
-  const merged: Array<{ start: number; end: number }> = [matches[0]];
-  for (let i = 1; i < matches.length; i++) {
-    const prev = merged[merged.length - 1];
-    if (matches[i].start <= prev.end) {
-      prev.end = Math.max(prev.end, matches[i].end);
-    } else {
-      merged.push(matches[i]);
-    }
-  }
-  return merged.map((r) => text.slice(r.start, r.end).trim().replace(/\s+/g, " "));
 }
 
 function pageEmoji(eventType: string): string {
