@@ -43,7 +43,36 @@ Subscriptions persist across session restarts because they're keyed on the works
 
 ## Setup
 
-See [SETUP.md](SETUP.md) for the end-to-end install walk-through.
+### Install as a Claude Code plugin (recommended)
+
+```bash
+git clone https://github.com/fryanpan/notion-channel-mcp ~/dev/notion-channel-mcp
+cd ~/dev/notion-channel-mcp
+bun install
+```
+
+Then inside any Claude Code session:
+
+```
+/plugin marketplace add ~/dev/notion-channel-mcp
+/plugin install notion-channel-mcp
+```
+
+This registers the MCP server and ships an auto-approve `PreToolUse` hook so the plugin's tools (`notion_watch_page`, `notion_unwatch_page`, `notion_list_my_watches`) don't prompt on first use — see [`hooks/auto-approve-plugin-ops.ts`](hooks/auto-approve-plugin-ops.ts) for the exact scope.
+
+You still need to follow [SETUP.md](SETUP.md) for the receiver-side pieces (Notion integration, Cloudflare tunnel, webhook subscription, launchd plist).
+
+### Install as a raw MCP server (legacy)
+
+If you're not on the plugin flow yet, the MCP server can be added directly:
+
+```bash
+claude mcp add --scope user --transport stdio notion-channel -- bun ~/dev/notion-channel-mcp/server.ts
+```
+
+You'll get an "Allow Claude to use ..." prompt the first time each tool is called. The plugin install path above eliminates those prompts.
+
+See [SETUP.md](SETUP.md) for the full end-to-end install walk-through (receiver, tunnel, Notion webhook, launchd).
 
 ## Status
 

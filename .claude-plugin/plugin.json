@@ -1,0 +1,16 @@
+{
+  "name": "notion-channel-mcp",
+  "version": "0.1.0",
+  "description": "Notion comment webhooks as Claude Code channel notifications",
+  "channels": [
+    {
+      "server": "notion-channel"
+    }
+  ],
+  "mcpServers": {
+    "notion-channel": {
+      "command": "bun",
+      "args": ["./server.ts"]
+    }
+  }
+}
