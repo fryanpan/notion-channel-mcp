@@ -41,6 +41,16 @@ Each agent subscribes to the pages it cares about. Three modes:
 
 Subscriptions persist across session restarts because they're keyed on the workspace's stable_id (the same `sha256(git_root || cwd)[:12]` claude-hive uses). When a session restarts in the same workspace, its subscriptions are still there — no need to re-subscribe.
 
+## Requirements
+
+[bun](https://bun.sh) — the server uses `bun:sqlite` and other Bun APIs, so node is not a
+substitute. You do not need bun on your `PATH`: the plugin ships a `/bin/sh` launcher that
+finds bun itself, so it works in sessions started by launchd, a GUI app, or cron, where
+your shell profile never runs.
+
+Your Notion token and port settings go in `~/.config/notion-channel-mcp/env`, which the
+launcher sources at startup — see [SETUP.md](./SETUP.md) step 3.
+
 ## Setup
 
 ### Install as a Claude Code plugin (recommended)

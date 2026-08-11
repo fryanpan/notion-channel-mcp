@@ -28,11 +28,33 @@ bun install
 
 ## 3. Configure environment
 
+If you installed this as a Claude Code plugin, put your configuration where the plugin
+launcher reads it:
+
 ```bash
-cp .env.example .env
+mkdir -p ~/.config/notion-channel-mcp
+cat > ~/.config/notion-channel-mcp/env <<'EOF'
+export NOTION_INTEGRATION_TOKEN=secret_...
+export NOTION_RECEIVER_PORT=8787
+EOF
+chmod 600 ~/.config/notion-channel-mcp/env
 ```
 
-Edit `.env` and paste the **Internal Integration Secret** into `NOTION_INTEGRATION_TOKEN`. Leave the rest at defaults unless you have a reason.
+This path is outside the plugin directory on purpose. The plugin cache is keyed by
+version, so each release installs into a fresh directory — a `.env` written inside the
+plugin is orphaned by the next upgrade, and because it is gitignored it never reaches
+anyone who installs from GitHub at all.
+
+Pick a `NOTION_RECEIVER_PORT` that nothing else is using, and make sure it matches the
+port your Cloudflare Tunnel forwards to in step 4. Check before you settle on the default:
+
+```bash
+lsof -nP -iTCP:8787 -sTCP:LISTEN    # should print nothing
+```
+
+For local development from a clone, `cp .env.example .env` and fill in the same values —
+bun loads `.env` automatically when you run from the repo, and the launcher still honours
+it as a fallback.
 
 ## 4. Install Cloudflare Tunnel
 
