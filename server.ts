@@ -47,7 +47,13 @@ import {
 } from "./shared/db.ts";
 
 const myStableId = computeStableId(process.cwd());
-const RECEIVER_PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8787", 10);
+// 8791, not 8787: the old default collided with another local service, and
+// because both bound different address families (IPv6 wildcard vs IPv4
+// loopback) they could both bind successfully while IPv4 traffic to
+// localhost:8787 silently went to whichever grabbed the specific address.
+// Override with NOTION_RECEIVER_PORT, and keep it matched to the Cloudflare
+// Tunnel ingress — see SETUP.md.
+const RECEIVER_PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8791", 10);
 const RECEIVER_DIR = import.meta.dir;
 const RECEIVER_LOG = join(
   homedir(),

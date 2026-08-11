@@ -34,7 +34,9 @@ import {
 } from "./shared/hive.ts";
 import type { NotionComment, NotionPage } from "./shared/types.ts";
 
-const PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8787", 10);
+// 8791, not 8787 — see the note in server.ts. Must match both the tunnel
+// ingress and whatever the MCP server uses to health-check this process.
+const PORT = parseInt(process.env.NOTION_RECEIVER_PORT ?? "8791", 10);
 const HEARTBEAT_MS = 15_000;
 const SUMMARY =
   "Notion webhook bridge — routes Notion comment and page events to subscribed peers";

@@ -35,7 +35,7 @@ launcher reads it:
 mkdir -p ~/.config/notion-channel-mcp
 cat > ~/.config/notion-channel-mcp/env <<'EOF'
 export NOTION_INTEGRATION_TOKEN=secret_...
-export NOTION_RECEIVER_PORT=8787
+export NOTION_RECEIVER_PORT=8791
 EOF
 chmod 600 ~/.config/notion-channel-mcp/env
 ```
@@ -45,12 +45,26 @@ version, so each release installs into a fresh directory — a `.env` written in
 plugin is orphaned by the next upgrade, and because it is gitignored it never reaches
 anyone who installs from GitHub at all.
 
-Pick a `NOTION_RECEIVER_PORT` that nothing else is using, and make sure it matches the
-port your Cloudflare Tunnel forwards to in step 4. Check before you settle on the default:
+The receiver port must satisfy two things: nothing else may be using it, and your
+Cloudflare Tunnel ingress (step 4) must forward to it. Check before you accept the
+default:
 
 ```bash
-lsof -nP -iTCP:8787 -sTCP:LISTEN    # should print nothing
+lsof -nP -iTCP:8791 -sTCP:LISTEN    # should print nothing
 ```
+
+> **Changed in v0.2.0: the default moved from 8787 to 8791.** 8787 is a popular
+> development port, and a collision there is unusually hard to diagnose: two processes
+> binding different address families — one on the IPv6 wildcard `*:8787`, one on IPv4
+> `127.0.0.1:8787` — both bind *successfully*, and IPv4 traffic to `localhost:8787` goes
+> to whichever claimed the specific address. Nothing errors; webhooks just quietly reach
+> the wrong process.
+>
+> If you are upgrading and your tunnel still points at 8787, the receiver will come up on
+> 8791 and Notion events will stop arriving until you update the ingress. Nothing else
+> breaks in the meantime, so the two changes do not have to be simultaneous. Either update
+> the ingress to 8791, or set `NOTION_RECEIVER_PORT=8787` to keep the old behaviour —
+> provided 8787 is genuinely free on your machine.
 
 For local development from a clone, `cp .env.example .env` and fill in the same values —
 bun loads `.env` automatically when you run from the repo, and the launcher still honours
@@ -83,11 +97,14 @@ credentials-file: /Users/YOUR_USERNAME/.cloudflared/<tunnel-id>.json
 
 ingress:
   - hostname: notion-bridge.YOUR-DOMAIN.com
-    service: http://localhost:8787
+    service: http://localhost:8791
   - service: http_status:404
 ```
 
 Replace `YOUR_USERNAME`, `<tunnel-id>`, and `YOUR-DOMAIN.com`.
+
+The port here must match `NOTION_RECEIVER_PORT` from step 3. If you are upgrading from a
+version that defaulted to 8787, this line is the one edit that restores delivery.
 
 ## 5. Install the cloudflared launchd service
 
@@ -163,8 +180,12 @@ tail -f ~/Library/Logs/notion-channel-receiver.log
 
 - `cloudflared tunnel list` — shows a healthy tunnel
 - `cloudflared tunnel info notion-bridge` — shows the active connector
-- `cat ~/.cloudflared/config.yml` — ingress rule points at `http://localhost:8787`
-- `curl http://localhost:8787/health` — receiver is alive locally
+- `cat ~/.cloudflared/config.yml` — ingress rule points at `http://localhost:8791`, the
+  same port as `NOTION_RECEIVER_PORT` (this pair drifted apart when the default moved
+  from 8787 in v0.2.0)
+- `curl http://localhost:8791/health` — receiver is alive locally, and returns
+  `{"status":"ok"}`. If it answers but with anything else, something *other* than this
+  receiver holds the port; check with `lsof -nP -iTCP:8791 -sTCP:LISTEN`
 
 **Comments arrive but the agent doesn't see them.** The peer's `stable_id` is registered in claude-hive but no `notion_watch_page` subscription exists for that `stable_id`. In the session, call `notion_list_my_watches` to confirm — if it's empty, the subscription was never made (or was made in a different workspace with a different stable_id).
 
