@@ -6,3 +6,5 @@ node_modules/
 *.db-shm
 logs/
 *.log
+.env.bak-*
+.env.*.bak
